@@ -57,56 +57,104 @@ get FOLDER string
 
 */
 
-foreach($list as $file) {
-	echo 'Processing: '.$file.' ...'."\n";
-	$fp = fopen($file, 'r');
-	$head = fread($fp, 4);
-	if ($head != 'AKPK') throw new \Exception('invalid header');
+class PckReader {
+	private $fp;
+	private $file;
+	private $folder;
+	private $header;
+	private $files = [];
 
-	list(,$headersize) = unpack('V', fread($fp, 4));
-	$header = fread($fp, $headersize);
-
-	// looks like genshin files are little endian
-	$data = unpack('Vversion/Vghsize/Vbkhd_hsize/Vriff_hsize/Vdata_len/Vvalue1/Vnamelen/Vvaluezero', $header);
-	//var_dump($data);
-
-	$header = substr($header, 4*8);
-
-	// read folder name?
-	$fname = iconv('UTF-16LE', 'UTF-8', substr($header, 0, $data['namelen']));
-	$pos = strpos($fname, "\0");
-	if ($pos !== false) $fname = substr($fname, 0, $pos);
-	//var_dump($fname);
-	$header = substr($header, $data['namelen']+4); // +4; because why not
-	//var_dump(strlen($header)); // == data_len
-
-	list(,$count_data) = unpack('V', $header);
-	$header = substr($header, 4);
-
-	if (($count_data * 24) != strlen($header)) die("bad count\n");
-
-	for($i = 0; $i < $count_data; $i++) {
-		$info = substr($header, 24*$i, 24);
-		// fadee448 d70a0000 01000000 f0890200 f4260000 00000000
-		// crc?     key?     ??       len      offset   ??
-		$info = unpack('Vcrc/Vkey/Vvalue1/Vlen/Voffset/Vvalue0', $info);
-
-		// extract file
-		$fn = $file.'_'.$fname.'_'.$info['key'];
-		echo 'Extracting '.$fn." ...\n";
-		$out = fopen($fn.'_raw.wav', 'w');
-		stream_copy_to_stream($fp, $out, $info['len'], $info['offset']);
-		fclose($out);
-
-		system('/pkg/main/dev-games.vgmstream.core/bin/vgmstream-cli -o '.escapeshellarg($fn.'.wav').' '.escapeshellarg($fn.'_raw.wav'), $res);
-		if ($res == 0)
-			unlink($fn.'_raw.wav');
-
-		//exit;
+	public function __construct($file) {
+		$this->file = $file;
+		$this->fp = fopen($file, 'r');
+		if (!$this->fp) throw new \Exception('failed to open file');
+		$this->readHeader();
 	}
 
-	// dump
-	//$pos = ftell($fp);system('hexdump -C -s '.$pos.' -n 4096 '.escapeshellarg($file));
+	private function readHeader() {
+		fseek($this->fp, 0);
 
-	//exit;
+		$head = fread($this->fp, 4);
+		if ($head != 'AKPK') throw new \Exception('invalid header');
+
+		list(,$headersize) = unpack('V', fread($this->fp, 4));
+		$header = fread($this->fp, $headersize);
+
+		// looks like genshin files are little endian
+		$data = unpack('Vversion/Vghsize/Vsize1/Vsize2/Vsize3/Vvalue1/Vnamelen', $header);
+		//var_dump($data);
+		$header = substr($header, 4*7);
+		$header = substr($header, $data['size1']); // skip bytes
+		$this->header = $data;
+
+		// read folder name?
+		$fname = iconv('UTF-16LE', 'UTF-8', substr($header, 0, $data['namelen']));
+		$pos = strpos($fname, "\0");
+		if ($pos !== false) $fname = substr($fname, 0, $pos);
+
+		$this->folder = $fname; // "sfx"
+		//var_dump($fname);
+		$header = substr($header, $data['namelen']); // +4; because why not
+		//var_dump(strlen($header)); // == data_len
+
+		$this->readFilelist(substr($header, 0, $data['size2']), 20);
+		$this->readFilelist(substr($header, $data['size2'], $data['size3']), 24);
+	}
+
+	private function readFilelist($data, $reclen) {
+		list(,$count_data) = unpack('V', $data);
+		$data = substr($data, 4);
+		echo 'Found '.$count_data.' files...'."\n";
+
+		if (($count_data * $reclen) != strlen($data)) {
+			var_dump($this->header);
+			throw new \Exception("bad count $count_data vs ".(strlen($data)/24));
+		}
+
+		for($i = 0; $i < $count_data; $i++) {
+			$info = substr($data, $reclen*$i, $reclen);
+			// fadee448 d70a0000 01000000 f0890200 f4260000 00000000
+			// crc?     key?     ??       len      offset   ??
+
+			// 64a34123 01000000 968e4900 54010000 00000000
+			// crc?     ??       len      offset   ??
+
+			switch($reclen) {
+				case 24:
+					$info = unpack('Vcrc/Vkey/Vvalue1/Vlen/Voffset/Vvalue0', $info);
+					break;
+				case 20:
+					$info = unpack('Vcrc/Vvalue1/Vlen/Voffset/Vvalue0', $info);
+					break;
+				default:
+					throw new \Exception('unsupported reclen');
+			}
+
+			$this->files[] = $info;
+		}
+	}
+
+	public function extract() {
+		echo 'Extracting: '.$this->file." ...\n";
+
+		foreach($this->files as $key => $info) {
+			// extract file
+			$fn = $this->file.'_'.$this->folder.'_'.$key;
+			echo 'Extracting '.$fn." ...\n";
+			$out = fopen($fn.'_raw.wav', 'w');
+			stream_copy_to_stream($this->fp, $out, $info['len'], $info['offset']);
+			fclose($out);
+
+			system('/pkg/main/dev-games.vgmstream.core/bin/vgmstream-cli -o '.escapeshellarg($fn.'.wav').' '.escapeshellarg($fn.'_raw.wav'), $res);
+			if ($res == 0)
+				unlink($fn.'_raw.wav');
+
+			//exit;
+		}
+	}
+}
+
+foreach($list as $file) {
+	$pck = new PckReader($file);
+	$pck->extract();
 }
